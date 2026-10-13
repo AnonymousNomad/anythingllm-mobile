@@ -194,10 +194,25 @@ function useChatHandler({ workspace, thread, llmProvider, ephemeral = false }: I
      */
     const abortControllerRef = useRef<AbortController | null>(null);
 
+    /**
+     * True while a turn is running that the user stopped on purpose (stop button, dismissing an
+     * overlay). A stopped reply is thrown away. A reply that was merely interrupted because the
+     * screen went away (thread/workspace switch) is the user's question and must not be lost - see
+     * `preserveInterruptedChat`. Reset when a new turn starts.
+     */
+    const userStoppedRef = useRef(false);
+
+    /**
+     * True once this handler's screen is unmounting. Distinguishes "left the thread mid-reply"
+     * from an explicit stop so the unfinished exchange can be saved instead of discarded.
+     */
+    const leftScreenRef = useRef(false);
+
     const abortChat = useCallback(() => {
         const controller = abortControllerRef.current;
         if (!controller || controller.signal.aborted) return;
         debug('Aborting current chat generation');
+        userStoppedRef.current = true;
         controller.abort();
     }, []);
 
@@ -301,6 +316,7 @@ function useChatHandler({ workspace, thread, llmProvider, ephemeral = false }: I
         // One abort controller per turn - the stop button fires it.
         const abortController = new AbortController();
         abortControllerRef.current = abortController;
+        userStoppedRef.current = false;
         const { signal } = abortController;
         llmProvider.attachAbortSignal(signal);
 
@@ -331,6 +347,37 @@ function useChatHandler({ workspace, thread, llmProvider, ephemeral = false }: I
                 llmProvider: llmProvider.name,
                 llmModel: llmProvider.model,
             });
+        };
+
+        /**
+         * The reply was interrupted because this screen went away mid-stream (thread or workspace
+         * switch). Finalize whatever was generated so far and save it, so returning to the thread
+         * still shows the question - and the partial answer, when there was one - instead of
+         * losing both. The model itself is still stopped; generation does not continue in the
+         * background, and the saved exchange can be replayed from the message actions.
+         */
+        const preserveInterruptedChat = async () => {
+            debug('Screen left mid-reply - preserving the partial exchange', turn.uuid);
+            clearFlushTimer();
+            const chatToSave = turn.finalize();
+            upsertChat(chatToSave);
+            uiStore.emitter.emit(CHAT_HANDLER_EVENTS.ASSISTANT_RESPONSE_COMPLETE, { uuid: turn.uuid });
+            await WorkspaceChat.create(chatToSave)
+                .then(() => debug('Partial chat saved to database', chatToSave.uuid))
+                .catch(err => debug('Error saving partial chat to database', err));
+            Telemetry.logEvent(Telemetry.CUSTOM_EVENTS.ACTIONS.CHAT_ABORTED, {
+                llmProvider: llmProvider.name,
+                llmModel: llmProvider.model,
+            });
+        };
+
+        /**
+         * A reply whose generation was stopped. An explicit stop discards it; a stop caused by
+         * leaving the screen preserves it.
+         */
+        const handleStoppedChat = () => {
+            if (leftScreenRef.current && !userStoppedRef.current && !ephemeral) return preserveInterruptedChat();
+            return discardAbortedChat();
         };
 
         try {
@@ -370,7 +417,7 @@ function useChatHandler({ workspace, thread, llmProvider, ephemeral = false }: I
                 }
 
                 const validConfig = await DelegatedProvider.validateConfig(config);
-                if (signal.aborted) return discardAbortedChat(); // stopped while checking the remote
+                if (signal.aborted) return handleStoppedChat(); // stopped while checking the remote
                 if (validConfig) {
                     // Never stream into the remote default thread - a legacy mirror gets its own remote thread first.
                     config.threadSlug = await remoteThreadSlug();
@@ -394,7 +441,7 @@ function useChatHandler({ workspace, thread, llmProvider, ephemeral = false }: I
 
             // Providers may surface a stop as an abort error or as a normal resolve with partial
             // text (llama.rn stopCompletion, SSE close) - the signal is the source of truth.
-            if (signal.aborted || isAbortError(callerError)) return discardAbortedChat();
+            if (signal.aborted || isAbortError(callerError)) return handleStoppedChat();
 
             if (callerError) {
                 debug('Error processing chat', callerError);
@@ -403,7 +450,7 @@ function useChatHandler({ workspace, thread, llmProvider, ephemeral = false }: I
             await concludeChat(turn);
         } catch (err) {
             clearFlushTimer();
-            if (signal.aborted || isAbortError(err)) return discardAbortedChat();
+            if (signal.aborted || isAbortError(err)) return handleStoppedChat();
             debug('Error processing chat', err);
             turn.fail((err as Error).message || i18n.t('chat.errors.processing'));
             const failedChat = turn.snapshot();
@@ -477,8 +524,13 @@ function useChatHandler({ workspace, thread, llmProvider, ephemeral = false }: I
         fetchChats();
         // On initial load, if a model is downloading, disable the prompt input to prevent crashes
         if (uiStore.session.has('@downloadInProgress')) disablePromptInput();
-        // Leaving the thread/workspace mid-reply stops the model - the turn can no longer be shown or saved.
-        return () => abortControllerRef.current?.abort();
+        // Leaving the thread/workspace mid-reply stops the model. The unfinished exchange is
+        // preserved instead of discarded (see handleStoppedChat) so a thread switch never
+        // silently loses the question.
+        return () => {
+            leftScreenRef.current = true;
+            abortControllerRef.current?.abort();
+        };
     }, []);
 
     useEffect(() => {
